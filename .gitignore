@@ -1,5 +1,18 @@
-# 忽略图片文件
+# ignore all images
 *.jpg
 *.png
 *.bmp
 *.gif
+
+# ignore all video
+*.mp4
+*.mkv
+*.avi
+*.mov
+.idea/
+
+# ignore apple
+*.DS_Store
+
+# ignore data
+*.npy
