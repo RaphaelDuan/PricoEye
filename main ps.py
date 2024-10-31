@@ -18,12 +18,23 @@ class PhotometricStereoSolver:
         plt.imshow(((PhotometricStereoSolver.normalize(norm * np.array([gain, gain, 1])) / 2 + .5) * 255).astype(np.uint8))
         plt.show()
 
-    def __init__(self, camera_pos: np.ndarray, light_pos: np.ndarray):
+    def __init__(
+            self,
+            camera_pos: np.ndarray,
+            light_pos: np.ndarray,
+            iteration: int = 2,
+            high_pass: float = 1e-3,
+            low_pass: float = 1e-5,
+            ):
         self.camera_pos = camera_pos[:, None, None, :]
         self.light_pos = light_pos[:, None, None, :]
 
+        self.iteration = iteration
+        self.high_pass = high_pass
+        self.low_pass = low_pass
+
     # luminance
-    def normal_solve(self, luminance: np.ndarray, iteration: int = 2):
+    def normal_solve(self, luminance: np.ndarray):
         *_, img_h, img_w = luminance.shape
 
         # get pixel location
@@ -41,7 +52,7 @@ class PhotometricStereoSolver:
         # do power iteration
         n = np.ones((img_h, img_w, 3), dtype=np.float64)
         n *= np.array([0, 0, 1])
-        for _ in range(iteration):
+        for _ in range(self.iteration):
             n = self.normalize(np.einsum('...ij,...i->...j', A, n))
             n *= np.sign(n[..., -1:])
 
@@ -60,8 +71,8 @@ class PhotometricStereoSolver:
         V, U = 2 * np.pi * (V / img_h - .5), 2 * np.pi * (U / img_w - .5)
 
         # derivative & integral & filter
-        H = - 1j * (U * X + V * Y) / (U ** 2 + V ** 2 + 1e-2)
-        H *= 1 / (1 + 1e-3 * np.sqrt(U ** 2 + V ** 2))
+        H = - 1j * (U * X + V * Y) / (U ** 2 + V ** 2 + self.high_pass)
+        H *= 1 / (1 + self.low_pass * np.sqrt(U ** 2 + V ** 2))
 
         return np.fft.ifft2(np.fft.ifftshift(H)).real
 
