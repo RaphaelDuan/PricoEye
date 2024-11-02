@@ -1,4 +1,5 @@
 import cv2
+import scipy
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -23,15 +24,17 @@ class PhotometricStereoSolver:
             camera_pos: np.ndarray,
             light_pos: np.ndarray,
             iteration: int = 2,
-            high_pass: float = 1e-3,
+            high_pass: float = 1e-4,
             low_pass: float = 1e-5,
-            ):
+    ):
         self.camera_pos = camera_pos[:, None, None, :]
         self.light_pos = light_pos[:, None, None, :]
 
         self.iteration = iteration
         self.high_pass = high_pass
         self.low_pass = low_pass
+
+        self.debug = True
 
     # luminance
     def normal_solve(self, luminance: np.ndarray):
@@ -74,11 +77,22 @@ class PhotometricStereoSolver:
         H = - 1j * (U * X + V * Y) / (U ** 2 + V ** 2 + self.high_pass)
         H *= 1 / (1 + self.low_pass * np.sqrt(U ** 2 + V ** 2))
 
+        if self.debug:
+            normal_map = np.stack(
+                [
+                    - np.fft.ifft2(np.fft.ifftshift(- 1j * U * H)).real,
+                    - np.fft.ifft2(np.fft.ifftshift(- 1j * V * H)).real,
+                    np.ones_like(H.real)
+                ], axis=-1
+            )
+            normal_map = self.normalize(normal_map)
+            self.show_normal(normal_map)
+
         return np.fft.ifft2(np.fft.ifftshift(H)).real
 
-    def solve(self, luminance: np.ndarray, debug: bool = False):
+    def solve(self, luminance: np.ndarray):
         normal_map = self.normal_solve(luminance)
-        if debug:
+        if self.debug:
             self.show_normal(normal_map)
         height_map = self.height_solve(normal_map)
         return height_map
@@ -90,44 +104,77 @@ def get_frame(cap: cv2.VideoCapture, frame_index: int):
     return frame
 
 
-video = cv2.VideoCapture("./data/TDM/IMG_2765.MOV")
+def get_groups_from_video(cap: cv2.VideoCapture):
+    # get light curve of video
+    avg_light = []
+    while True:
+        _, frame = cap.read()
+        if frame is None:
+            break
+        avg_light.append(np.mean(frame))
+    avg_light = np.array(avg_light)
 
-# read in images from video and cut out ROI
-frame_idx_init, frame_idx_step = 250, 120
-imgs = [
-    get_frame(video, frame_idx_init + 0 * frame_idx_step).mean(axis=-1),
-    get_frame(video, frame_idx_init + 1 * frame_idx_step).mean(axis=-1),
-    get_frame(video, frame_idx_init + 2 * frame_idx_step).mean(axis=-1),
-    get_frame(video, frame_idx_init + 3 * frame_idx_step).mean(axis=-1),
-    get_frame(video, frame_idx_init + 4 * frame_idx_step).mean(axis=-1),
-]
-imgs = np.stack(imgs, axis=0).astype(np.float64) / 255.
-(_, h, w), r = imgs.shape, 1100
-imgs = imgs[..., (h - r) // 2:(h + r) // 2, (w - r) // 2:(w + r) // 2]
+    # find edges of the light curve
+    diff_avg_light = np.diff(avg_light)
+    rising_edge, _ = scipy.signal.find_peaks(diff_avg_light, threshold=1, distance=5)
+    falling_edge, _ = scipy.signal.find_peaks(-diff_avg_light, threshold=1, distance=5)
 
-# show gray image
-plt.imshow(np.mean(imgs, axis=0), cmap='gray')
-plt.show()
+    # get rise edge with pulse width before and after
+    state_edge = [(r, np.min((r - falling_edge)[falling_edge < r]), np.min((falling_edge - r)[falling_edge > r])) for r in rising_edge if np.any(falling_edge < r) and np.any(falling_edge > r)]
 
-# set up the configuration
-l_r, l_h, c_h = 4000, 10000, 10000
-light_angle = np.deg2rad(np.array([-30, 30, 90, 150, 210]))
-solver = PhotometricStereoSolver(
-    camera_pos=np.array([0, 0, c_h]) * np.ones(len(imgs))[:, None],
-    light_pos=np.stack([l_r * np.cos(light_angle), l_r * np.sin(light_angle), l_h * np.ones_like(light_angle)], axis=-1)
-)
+    # split groups by black length
+    groups = []
+    tmp_group = []
+    for frame_idx, width_before, width_after in state_edge:
+        if width_before >= 15:
+            tmp_group = [frame_idx - width_before // 2, ]
+        tmp_group.append(frame_idx + width_after // 2)
+        if len(tmp_group) == 5 + 1:
+            groups.append(tmp_group)
+            tmp_group = []
 
-# solve height
-height = solver.solve(imgs, debug=True)
+    return groups
 
-# save result
-np.save("height.npy", height)
 
-# normalization
-height = (height - np.min(height)) / (np.max(height) - np.min(height))
-cv2.imwrite('h.png', (height * 255).astype(np.uint8))
+video = cv2.VideoCapture("./data/TDM/IMG_2842.MOV")
+groups = get_groups_from_video(video)
 
-# show
-clip = .005
-plt.imshow(np.clip(height, np.quantile(height, clip), np.quantile(height, 1 - clip)))
-plt.show()
+for group_idx, group in enumerate(groups):
+    # read in images from video and cut out ROI
+    gamma, blur_r = 0.92, 15
+    imgs = [(get_frame(video, idx).astype(np.float64) / 255.).mean(axis=-1) ** (1 / gamma) for idx in group]
+    dark_field, *imgs = imgs
+    dark_field = cv2.blur(dark_field, (blur_r, blur_r))
+    imgs = np.stack(imgs, axis=0)
+    imgs = np.maximum(imgs - dark_field, 0)
+    (_, h, w), r = imgs.shape, 1300
+    imgs = imgs[..., (h - r) // 2:(h + r) // 2, (w - r) // 2:(w + r) // 2]
+
+    # show gray image
+    plt.imshow(np.mean(imgs, axis=0), cmap='gray')
+    plt.title(f'Group {group_idx} gray image')
+    plt.show()
+
+    # set up the configuration
+    l_r, l_h, c_h = 1000, 6000, 6000
+    light_angle = np.deg2rad(np.array([-30, 30, 90, 150, 210]))
+    solver = PhotometricStereoSolver(
+        camera_pos=np.array([0, 0, c_h]) * np.ones(len(imgs))[:, None],
+        light_pos=np.stack([l_r * np.cos(light_angle), l_r * np.sin(light_angle), l_h * np.ones_like(light_angle)], axis=-1)
+    )
+
+    # solve height
+    height = solver.solve(imgs)
+
+    # save result
+    np.save(f"height_{group_idx}.npy", height)
+
+    # normalization
+    height = (height - np.min(height)) / (np.max(height) - np.min(height))
+    cv2.imwrite(f"height_{group_idx}.png", (height * 255).astype(np.uint8))
+
+    # show
+    clip = .005
+    plt.imshow(np.clip(height, np.quantile(height, clip), np.quantile(height, 1 - clip)))
+    plt.title(f'Group {group_idx} height image')
+    plt.show()
